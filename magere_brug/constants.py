@@ -25,7 +25,7 @@ HOOK_INTERVAL_MS = 1500
 # Delay before focus-out can dismiss the navigator (avoids open-race).
 FOCUS_OUT_ARM_MS = 200
 
-HINT_TEXT = '↑↓ select   1–9 jump   Enter open   Esc close'
+HINT_TEXT = '↑↓ select   F2 rename   1–9 jump   Enter open   Esc close'
 
 # Word-boundary characters for fuzzy scoring.
 WORD_BOUNDARY = ' /.-_[]'

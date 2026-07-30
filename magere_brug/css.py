@@ -40,6 +40,14 @@ window.magere-brug-nav search {
   font-size: 0.85em;
   min-width: 1.6em;
 }
+.magere-brug-actions button {
+  padding: 4px 10px;
+}
+.magere-brug-rename-bar {
+  background-color: alpha(@theme_selected_bg_color, 0.12);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
 list row:selected {
   background-color: alpha(@theme_selected_bg_color, 0.85);
   color: @theme_selected_fg_color;

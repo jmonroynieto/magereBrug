@@ -72,9 +72,10 @@ The binding is re-read on each keypress (no restart needed for the string).
 | Hotkey | Toggle navigator (if ≥2 terminals) |
 | ↑ / ↓ | Move selection |
 | Page Up / Down | Jump by 5 |
+| F2 or **Rename** | Rename selected terminal (inline bar) |
 | 1–9 | Open Nth row (when search is empty) |
-| Enter | Open selection; empty query → previous MRU |
-| Esc | Close and refocus source terminal |
+| Enter | Open selection; empty query → previous MRU; apply rename |
+| Esc | Cancel rename, or close and refocus source terminal |
 | Click outside | Close |
 
 ## Development

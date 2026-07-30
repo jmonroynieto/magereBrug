@@ -76,11 +76,15 @@ class MagereBrug(plugin.MenuItem):
         self.search_entry: Optional[Gtk.SearchEntry] = None
         self.list_box: Optional[Gtk.ListBox] = None
         self.hint_label: Optional[Gtk.Label] = None
+        self.rename_bar: Optional[Gtk.Box] = None
+        self.rename_entry: Optional[Gtk.Entry] = None
+        self.rename_btn: Optional[Gtk.Button] = None
 
         self.terminals_data: List[Dict[str, Any]] = []
         self._visible_rows: List[Gtk.ListBoxRow] = []
         self._mru: List[Any] = []
         self._source_terminal = None
+        self._rename_term = None  # terminal being renamed, if any
 
         self._hook_timeout_id: Optional[int] = None
         self._css_provider = None
@@ -481,8 +485,12 @@ class MagereBrug(plugin.MenuItem):
 
         if self.search_entry is not None:
             self.search_entry.set_text('')
+        self._exit_rename_mode()
         self._update_list_view()
         self.window.show_all()
+        # Keep rename bar hidden until F2 / Rename is used.
+        if self.rename_bar is not None:
+            self.rename_bar.hide()
         self._placement.place(self.window, parent)
         try:
             self.window.present()
@@ -552,10 +560,39 @@ class MagereBrug(plugin.MenuItem):
         self.list_box.connect('key-press-event', self._on_modal_key_press)
         scrolled.add(self.list_box)
 
+        # Inline rename strip (hidden until F2 / Rename).
+        self.rename_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        _add_class(self.rename_bar, 'magere-brug-rename-bar')
+        rename_lbl = Gtk.Label(label='Rename', xalign=0)
+        self.rename_entry = Gtk.Entry()
+        self.rename_entry.set_placeholder_text('Terminal title…')
+        self.rename_entry.set_hexpand(True)
+        self.rename_entry.connect('key-press-event', self._on_rename_key_press)
+        self.rename_entry.connect('activate', lambda *_a: self._commit_rename())
+        apply_btn = Gtk.Button.new_with_label('Apply')
+        apply_btn.connect('clicked', lambda *_a: self._commit_rename())
+        cancel_btn = Gtk.Button.new_with_label('Cancel')
+        cancel_btn.connect(
+            'clicked', lambda *_a: self._exit_rename_mode(focus_search=True)
+        )
+        self.rename_bar.pack_start(rename_lbl, False, False, 0)
+        self.rename_bar.pack_start(self.rename_entry, True, True, 0)
+        self.rename_bar.pack_start(apply_btn, False, False, 0)
+        self.rename_bar.pack_start(cancel_btn, False, False, 0)
+        vbox.pack_start(self.rename_bar, False, False, 0)
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        _add_class(actions, 'magere-brug-actions')
+        self.rename_btn = Gtk.Button.new_with_mnemonic('_Rename')
+        self.rename_btn.set_tooltip_text('Rename selected terminal (F2)')
+        self.rename_btn.connect('clicked', lambda *_a: self._start_rename())
+        actions.pack_start(self.rename_btn, False, False, 0)
         self.hint_label = Gtk.Label(label=HINT_TEXT, xalign=0)
         self.hint_label.set_line_wrap(True)
+        self.hint_label.set_hexpand(True)
         _add_class(self.hint_label, 'magere-brug-hint')
-        vbox.pack_start(self.hint_label, False, False, 0)
+        actions.pack_start(self.hint_label, True, True, 0)
+        vbox.pack_start(actions, False, False, 0)
 
         win.connect('key-press-event', self._on_modal_key_press)
         win.connect('focus-out-event', self._on_window_focus_out)
@@ -570,6 +607,10 @@ class MagereBrug(plugin.MenuItem):
         self.search_entry = None
         self.list_box = None
         self.hint_label = None
+        self.rename_bar = None
+        self.rename_entry = None
+        self.rename_btn = None
+        self._rename_term = None
         self._visible_rows = []
 
     def _on_delete(self, *_args) -> bool:
@@ -595,6 +636,7 @@ class MagereBrug(plugin.MenuItem):
         if self._closing:
             return
         self._closing = True
+        self._exit_rename_mode()
         self._placement.cancel()
         self._focus_out_armed = False
         win = self.window
@@ -798,15 +840,168 @@ class MagereBrug(plugin.MenuItem):
     def _on_row_activated(self, _listbox, row) -> None:
         if not getattr(row, 'is_term_row', False):
             return
+        if self._rename_term is not None:
+            self._exit_rename_mode()
         self._close_navigator(refocus=getattr(row, 'terminal_obj', None))
+
+    # --------------------------------------------------------------- rename
+
+    def _start_rename(self, term=None) -> bool:
+        """Show the rename bar for *term* or the selected row. Returns True if started."""
+        if term is None:
+            row = self._selected_term_row()
+            if row is None:
+                return False
+            term = getattr(row, 'terminal_obj', None)
+        if term is None or not self._term_alive(term):
+            return False
+        if self.rename_bar is None or self.rename_entry is None:
+            return False
+
+        self._rename_term = term
+        current = self._terminal_title(term)
+        # Prefer an existing custom label if present.
+        titlebar = getattr(term, 'titlebar', None)
+        if titlebar is not None:
+            custom = first_attr(titlebar, ('get_custom_string', 'get_custom_label'))
+            if custom:
+                current = str(custom)
+
+        self.rename_entry.set_text(current)
+        self.rename_bar.show_all()
+        self.rename_entry.grab_focus()
+        self.rename_entry.select_region(0, -1)
+        if self.rename_btn is not None:
+            self.rename_btn.set_sensitive(False)
+        return True
+
+    def _exit_rename_mode(self, focus_search: bool = False) -> None:
+        self._rename_term = None
+        if self.rename_entry is not None:
+            self.rename_entry.set_text('')
+        if self.rename_bar is not None:
+            self.rename_bar.hide()
+        if self.rename_btn is not None:
+            self.rename_btn.set_sensitive(True)
+        if focus_search and self.search_entry is not None:
+            try:
+                self.search_entry.grab_focus()
+            except Exception:
+                pass
+
+    def _commit_rename(self) -> bool:
+        term = self._rename_term
+        if term is None or self.rename_entry is None:
+            self._exit_rename_mode(focus_search=True)
+            return False
+        name = self.rename_entry.get_text().strip()
+        ok = self._set_terminal_title(term, name)
+        if not ok:
+            err('magereBrug: could not set terminal title')
+        # Refresh list so the new title shows; stay in the navigator.
+        self._gather_terminals()
+        self._exit_rename_mode()
+        self._update_list_view()
+        self._select_terminal_row(term)
+        if self.search_entry is not None:
+            self.search_entry.grab_focus()
+        return ok
+
+    def _select_terminal_row(self, term) -> None:
+        if not self.list_box or term is None:
+            return
+        for row in self._visible_rows:
+            if getattr(row, 'terminal_obj', None) is term:
+                self.list_box.select_row(row)
+                self._ensure_row_visible(row)
+                return
+
+    def _set_terminal_title(self, term, name: str) -> bool:
+        """Apply a custom title via Terminator titlebar APIs (best-effort)."""
+        titlebar = getattr(term, 'titlebar', None)
+        tried = False
+        if titlebar is not None:
+            for method in ('set_custom_string', 'set_custom_label', 'set_title'):
+                if hasattr(titlebar, method):
+                    try:
+                        getattr(titlebar, method)(name if name else None)
+                        tried = True
+                        break
+                    except TypeError:
+                        try:
+                            getattr(titlebar, method)(name)
+                            tried = True
+                            break
+                        except Exception:
+                            continue
+                    except Exception as exc:
+                        err('magereBrug title %s: %s' % (method, exc))
+            if not tried:
+                for attr in ('custom_string', 'customtext', 'custom_label'):
+                    if hasattr(titlebar, attr):
+                        try:
+                            setattr(titlebar, attr, name if name else None)
+                            tried = True
+                            break
+                        except Exception:
+                            continue
+            if tried and hasattr(titlebar, 'update'):
+                try:
+                    titlebar.update()
+                except Exception:
+                    pass
+            if tried:
+                return True
+
+        for method in ('set_title', 'force_set_title'):
+            if hasattr(term, method):
+                try:
+                    getattr(term, method)(name)
+                    return True
+                except Exception as exc:
+                    err('magereBrug term.%s: %s' % (method, exc))
+        return False
+
+    def _on_rename_key_press(self, _widget, event) -> bool:
+        keyval = event.keyval
+        if keyval == Gdk.KEY_Escape:
+            self._exit_rename_mode(focus_search=True)
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self._commit_rename()
+            return True
+        return False
 
     def _on_modal_key_press(self, _widget, event) -> bool:
         keyval = event.keyval
         mods = event.state & Gtk.accelerator_get_default_mod_mask()
 
+        # While renaming, Esc/Enter apply to the rename bar; block palette nav.
+        if self._rename_term is not None:
+            if keyval == Gdk.KEY_Escape:
+                self._exit_rename_mode(focus_search=True)
+                return True
+            if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                self._commit_rename()
+                return True
+            if keyval in (
+                Gdk.KEY_Down,
+                Gdk.KEY_Up,
+                Gdk.KEY_KP_Down,
+                Gdk.KEY_KP_Up,
+                Gdk.KEY_Page_Down,
+                Gdk.KEY_Page_Up,
+                Gdk.KEY_F2,
+            ):
+                return True
+
         if keyval == Gdk.KEY_Escape:
             self._close_navigator(refocus=self._source_terminal)
             return True
+
+        if keyval == Gdk.KEY_F2:
+            if self._start_rename():
+                return True
 
         if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
             self._handle_enter()
@@ -844,6 +1039,10 @@ class MagereBrug(plugin.MenuItem):
         return False
 
     def _handle_enter(self) -> None:
+        if self._rename_term is not None:
+            self._commit_rename()
+            return
+
         query = self.search_entry.get_text().strip() if self.search_entry else ''
         row = self._selected_term_row()
         first = self._visible_rows[0] if self._visible_rows else None
