@@ -1,0 +1,866 @@
+"""MagereBrug Terminator plugin — terminal navigator UI and bindings."""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+import gi
+
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+gi.require_version('Pango', '1.0')
+from gi.repository import Gdk, GLib, Gtk, Pango
+
+import terminatorlib.plugin as plugin
+from terminatorlib.terminator import Terminator
+from terminatorlib.util import dbg, err
+
+try:
+    from terminatorlib.config import Config
+except Exception:  # pragma: no cover
+    Config = None  # type: ignore
+
+from magere_brug.constants import (
+    DEFAULT_KEYBINDING,
+    FOCUS_OUT_ARM_MS,
+    HINT_TEXT,
+    HOOK_INTERVAL_MS,
+    NAV_HEIGHT,
+    NAV_WIDTH,
+    PLUGIN_NAME,
+)
+from magere_brug.css import NAV_CSS
+from magere_brug.placement import PlacementController
+from magere_brug.util import (
+    cmdline_for_pid,
+    filter_and_group,
+    first_attr,
+    shorten_path,
+)
+
+
+def _add_class(widget: Gtk.Widget, name: str) -> None:
+    try:
+        widget.get_style_context().add_class(name)
+    except Exception:
+        pass
+
+
+def _parse_accel(accel_str: str):
+    """Return (keyval, modifier_mask) or (None, None)."""
+    try:
+        result = Gtk.accelerator_parse(accel_str)
+        if isinstance(result, tuple) and len(result) == 3:
+            ok, keyval, mods = result
+            if not ok or not keyval:
+                return None, None
+            return keyval, mods
+        if isinstance(result, tuple) and len(result) == 2:
+            keyval, mods = result
+            if not keyval:
+                return None, None
+            return keyval, mods
+    except Exception as exc:
+        err('magereBrug accel parse %r: %s' % (accel_str, exc))
+    return None, None
+
+
+class MagereBrug(plugin.MenuItem):
+    """Terminal switcher: context menu + configurable hotkey (default Ctrl+P)."""
+
+    capabilities = ['terminal_menu']
+
+    def __init__(self) -> None:
+        plugin.MenuItem.__init__(self)
+        self.window: Optional[Gtk.Window] = None
+        self.search_entry: Optional[Gtk.SearchEntry] = None
+        self.list_box: Optional[Gtk.ListBox] = None
+        self.hint_label: Optional[Gtk.Label] = None
+
+        self.terminals_data: List[Dict[str, Any]] = []
+        self._visible_rows: List[Gtk.ListBoxRow] = []
+        self._mru: List[Any] = []
+        self._source_terminal = None
+
+        self._hook_timeout_id: Optional[int] = None
+        self._css_provider = None
+        self._placement = PlacementController()
+        self._focus_out_armed = False
+        self._closing = False
+
+        GLib.idle_add(self._deferred_setup)
+
+    # ---------------------------------------------------------------- lifecycle
+
+    def _deferred_setup(self) -> bool:
+        dbg('magereBrug: plugin setup')
+        self._ensure_css()
+        self._hook_timeout_id = GLib.timeout_add(
+            HOOK_INTERVAL_MS, self._hook_terminal_listeners
+        )
+        self._hook_terminal_listeners()
+        return False
+
+    def unload(self) -> None:
+        if self._hook_timeout_id is not None:
+            GLib.source_remove(self._hook_timeout_id)
+            self._hook_timeout_id = None
+        self._placement.cancel()
+        if self.window is not None:
+            try:
+                self.window.destroy()
+            except Exception:
+                pass
+            self.window = None
+        try:
+            for term in self._all_terminals():
+                self._unhook_terminal(term)
+        except Exception as exc:
+            err('magereBrug unload: %s' % exc)
+
+    def callback(self, menuitems, menu, terminal) -> None:
+        """Add the navigator item to the terminal context menu (3-arg API)."""
+        item = Gtk.MenuItem.new_with_mnemonic('magereBrug _Navigator...')
+        item.connect(
+            'activate',
+            lambda _w: self.toggle_navigator(source_terminal=terminal),
+        )
+        menuitems.append(item)
+
+    # ---------------------------------------------------------- config / keys
+
+    def _plugin_config(self) -> dict:
+        if Config is None:
+            return {}
+        try:
+            cfg = Config()
+            if hasattr(cfg, 'plugin_get_config'):
+                section = cfg.plugin_get_config(PLUGIN_NAME)
+                if isinstance(section, dict):
+                    return section
+            plugins = None
+            try:
+                plugins = cfg['plugins']
+            except Exception:
+                plugins = getattr(cfg, 'plugin_config', None)
+            if isinstance(plugins, dict):
+                section = plugins.get(PLUGIN_NAME) or plugins.get('magereBrug')
+                if isinstance(section, dict):
+                    return section
+        except Exception as exc:
+            err('magereBrug config: %s' % exc)
+        return {}
+
+    def _keybinding_accel(self) -> str:
+        section = self._plugin_config()
+        for key in ('keybinding', 'hotkey', 'accel'):
+            val = section.get(key) if section else None
+            if val:
+                return str(val).strip()
+        return DEFAULT_KEYBINDING
+
+    def _event_matches_hotkey(self, event) -> bool:
+        keyval, mods = _parse_accel(self._keybinding_accel())
+        if keyval is None:
+            keyval, mods = _parse_accel(DEFAULT_KEYBINDING)
+        if keyval is None:
+            return False
+        mask = Gtk.accelerator_get_default_mod_mask()
+        return (
+            Gdk.keyval_to_lower(event.keyval) == Gdk.keyval_to_lower(keyval)
+            and (event.state & mask) == ((mods or 0) & mask)
+        )
+
+    # ------------------------------------------------------------- terminals
+
+    @staticmethod
+    def _all_terminals() -> list:
+        try:
+            return list(getattr(Terminator(), 'terminals', []) or [])
+        except Exception:
+            return []
+
+    def _hook_terminal_listeners(self) -> bool:
+        try:
+            for term in self._all_terminals():
+                self._hook_one_terminal(term)
+            self._hook_windows()
+        except Exception as exc:
+            err('magereBrug hook listeners: %s' % exc)
+        return True
+
+    def _hook_windows(self) -> None:
+        seen = set()
+        for term in self._all_terminals():
+            try:
+                top = term.get_toplevel()
+            except Exception:
+                continue
+            if top is None or id(top) in seen:
+                continue
+            seen.add(id(top))
+            if getattr(top, '_magere_brug_win_bound', False):
+                continue
+            try:
+                top.connect(
+                    'add',
+                    lambda *_a: GLib.timeout_add(100, self._hook_once),
+                )
+                top._magere_brug_win_bound = True
+            except Exception:
+                pass
+
+    def _hook_once(self) -> bool:
+        self._hook_terminal_listeners()
+        return False
+
+    def _hook_one_terminal(self, term) -> None:
+        vte = getattr(term, 'vte', None)
+        if vte is None:
+            return
+        if not getattr(vte, '_magere_brug_bound', False):
+            try:
+                vte.connect('key-press-event', self._on_vte_key_press)
+                vte._magere_brug_bound = True
+            except Exception as exc:
+                err('magereBrug bind key: %s' % exc)
+        if not getattr(term, '_magere_brug_focus_bound', False):
+            try:
+                term.connect('focus-in-event', self._on_terminal_focus_in)
+                term._magere_brug_focus_bound = True
+            except Exception:
+                try:
+                    vte.connect(
+                        'focus-in-event',
+                        lambda _w, _e, t=term: self._note_mru(t) or False,
+                    )
+                    term._magere_brug_focus_bound = True
+                except Exception as exc:
+                    err('magereBrug bind focus: %s' % exc)
+        if term not in self._mru:
+            self._mru.append(term)
+
+    def _unhook_terminal(self, term) -> None:
+        vte = getattr(term, 'vte', None)
+        if vte and getattr(vte, '_magere_brug_bound', False):
+            try:
+                vte.disconnect_by_func(self._on_vte_key_press)
+            except (TypeError, AttributeError):
+                pass
+            vte._magere_brug_bound = False
+        if getattr(term, '_magere_brug_focus_bound', False):
+            try:
+                term.disconnect_by_func(self._on_terminal_focus_in)
+            except (TypeError, AttributeError):
+                pass
+            term._magere_brug_focus_bound = False
+
+    def _on_terminal_focus_in(self, term, _event) -> bool:
+        self._note_mru(term)
+        return False
+
+    def _note_mru(self, term) -> bool:
+        if term is None:
+            return False
+        try:
+            self._mru = [t for t in self._mru if t is not term and self._term_alive(t)]
+            self._mru.insert(0, term)
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _term_alive(term) -> bool:
+        try:
+            return term is not None and getattr(term, 'vte', None) is not None
+        except Exception:
+            return False
+
+    def _on_vte_key_press(self, widget, event) -> bool:
+        """Intercept hotkey only when two or more terminals exist."""
+        try:
+            if not self._event_matches_hotkey(event):
+                return False
+            if len(self._all_terminals()) <= 1:
+                return False
+            source = self._terminal_for_vte(widget)
+            GLib.idle_add(
+                lambda s=source: self.toggle_navigator(source_terminal=s) or False
+            )
+            return True
+        except Exception as exc:
+            err('magereBrug keypress: %s' % exc)
+        return False
+
+    def _terminal_for_vte(self, vte_widget):
+        for term in self._all_terminals():
+            if getattr(term, 'vte', None) is vte_widget:
+                return term
+        return None
+
+    def _current_terminal(self):
+        if self._source_terminal is not None and self._term_alive(self._source_terminal):
+            return self._source_terminal
+        for term in self._mru:
+            if self._term_alive(term):
+                return term
+        terms = self._all_terminals()
+        return terms[0] if terms else None
+
+    def _previous_terminal(self, current=None):
+        current = current or self._current_terminal()
+        for term in self._mru:
+            if self._term_alive(term) and term is not current:
+                return term
+        for term in self._all_terminals():
+            if term is not current:
+                return term
+        return None
+
+    # --------------------------------------------------------- metadata
+
+    def _terminal_title(self, term) -> str:
+        title = first_attr(term, ('get_window_title',))
+        if title:
+            return str(title)
+        titlebar = getattr(term, 'titlebar', None)
+        if titlebar is not None:
+            custom = first_attr(titlebar, ('get_custom_string',))
+            if custom:
+                return str(custom)
+        vte = getattr(term, 'vte', None)
+        if vte is not None:
+            t = first_attr(vte, ('get_window_title',))
+            if t:
+                return str(t)
+        return 'Unnamed Terminal'
+
+    def _terminal_cwd(self, term) -> Optional[str]:
+        cwd = first_attr(term, ('get_cwd', 'cwd'))
+        if cwd:
+            return shorten_path(str(cwd))
+        vte = getattr(term, 'vte', None)
+        if vte is not None and hasattr(vte, 'get_current_directory_uri'):
+            try:
+                uri = vte.get_current_directory_uri()
+                if uri:
+                    if uri.startswith('file://'):
+                        path = GLib.filename_from_uri(uri)[0]
+                    else:
+                        path = uri
+                    return shorten_path(path)
+            except Exception:
+                pass
+        return None
+
+    def _terminal_command(self, term) -> Optional[str]:
+        pid = first_attr(term, ('pid', 'get_pid'))
+        vte = getattr(term, 'vte', None)
+        if pid is None and vte is not None:
+            pid = first_attr(vte, ('get_pid', 'pid'))
+        if pid:
+            cmd = cmdline_for_pid(pid)
+            if cmd:
+                return cmd
+        if vte is not None:
+            t = first_attr(vte, ('get_window_title',))
+            if t:
+                return str(t)
+        return None
+
+    def _window_title_for_term(self, term) -> str:
+        try:
+            parent = term.get_toplevel()
+            if parent is not None and hasattr(parent, 'get_title'):
+                t = parent.get_title()
+                if t:
+                    return t
+        except Exception:
+            pass
+        return 'Window'
+
+    def _window_key_for_term(self, term):
+        try:
+            top = term.get_toplevel()
+            if top is not None:
+                return id(top)
+        except Exception:
+            pass
+        return 0
+
+    def _mru_index(self, term) -> int:
+        try:
+            return self._mru.index(term)
+        except ValueError:
+            return 10 ** 6
+
+    def _gather_terminals(self) -> None:
+        self.terminals_data = []
+        try:
+            live = self._all_terminals()
+            self._mru = [t for t in self._mru if t in live]
+            for term in live:
+                if term not in self._mru:
+                    self._mru.append(term)
+                title = self._terminal_title(term)
+                cwd = self._terminal_cwd(term)
+                cmd = self._terminal_command(term)
+                win_title = self._window_title_for_term(term)
+                bits = [b for b in (cwd, cmd if cmd != title else None) if b]
+                detail = ' · '.join(bits) if bits else 'Idle'
+                self.terminals_data.append({
+                    'object': term,
+                    'title': title,
+                    'context': '[%s] %s' % (win_title, detail),
+                    'cwd': cwd,
+                    'cmd': cmd,
+                    'win_title': win_title,
+                    'win_key': self._window_key_for_term(term),
+                    'search': ' '.join(
+                        x for x in (title, win_title, cwd or '', cmd or '', detail) if x
+                    ),
+                    'mru_index': self._mru_index(term),
+                })
+        except Exception as exc:
+            err('magereBrug gather terminals: %s' % exc)
+
+    def _resolve_parent_window(self, source_terminal=None) -> Optional[Gtk.Window]:
+        candidates = []
+        if source_terminal is not None:
+            candidates.append(source_terminal)
+        candidates.extend(self._all_terminals())
+        for term in candidates:
+            try:
+                top = term.get_toplevel() if hasattr(term, 'get_toplevel') else None
+                if top is not None and isinstance(top, Gtk.Window):
+                    return top
+            except Exception:
+                continue
+        return None
+
+    # ---------------------------------------------------------------- theme
+
+    def _ensure_css(self) -> None:
+        if self._css_provider is not None:
+            return
+        try:
+            provider = Gtk.CssProvider()
+            provider.load_from_data(NAV_CSS)
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(),
+                provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+            self._css_provider = provider
+        except Exception as exc:
+            err('magereBrug css: %s' % exc)
+
+    # ----------------------------------------------------------- open / close
+
+    def toggle_navigator(self, source_terminal=None) -> None:
+        if self.window is not None and self.window.get_visible():
+            self._close_navigator(refocus=self._source_terminal or source_terminal)
+            return
+
+        self._source_terminal = source_terminal or self._current_terminal()
+        if self._source_terminal is not None:
+            self._note_mru(self._source_terminal)
+
+        self._gather_terminals()
+        parent = self._resolve_parent_window(self._source_terminal)
+
+        if self.window is None:
+            self._build_window(parent)
+        else:
+            if parent is not None:
+                try:
+                    self.window.set_transient_for(parent)
+                except Exception:
+                    pass
+            self._placement.schedule(self.window, parent)
+
+        if self.search_entry is not None:
+            self.search_entry.set_text('')
+        self._update_list_view()
+        self.window.show_all()
+        self._placement.place(self.window, parent)
+        try:
+            self.window.present()
+        except Exception:
+            pass
+        self._focus_out_armed = False
+        GLib.timeout_add(FOCUS_OUT_ARM_MS, self._arm_focus_out)
+        if self.search_entry is not None:
+            self.search_entry.grab_focus()
+
+    def _arm_focus_out(self) -> bool:
+        self._focus_out_armed = True
+        return False
+
+    def _build_window(self, parent: Optional[Gtk.Window]) -> None:
+        self._ensure_css()
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        self.window = win
+        win.set_title('magereBrug Navigator')
+        win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        win.set_decorated(False)
+        win.set_skip_taskbar_hint(True)
+        win.set_skip_pager_hint(True)
+        win.set_accept_focus(True)
+        win.set_focus_on_map(True)
+        win.set_resizable(False)
+        win.set_default_size(NAV_WIDTH, NAV_HEIGHT)
+        win.set_size_request(NAV_WIDTH, NAV_HEIGHT)
+        # Soft modal: click-outside can dismiss via focus-out.
+        win.set_modal(False)
+        try:
+            win.set_keep_above(True)
+        except Exception:
+            pass
+        _add_class(win, 'magere-brug-nav')
+
+        if parent is not None:
+            win.set_transient_for(parent)
+            win.set_destroy_with_parent(True)
+            win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        else:
+            win.set_position(Gtk.WindowPosition.CENTER)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        vbox.set_margin_start(16)
+        vbox.set_margin_end(16)
+        vbox.set_margin_top(16)
+        vbox.set_margin_bottom(12)
+        win.add(vbox)
+
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text(
+            'Search title, window, path, or command...'
+        )
+        self.search_entry.connect('search-changed', self._on_search_changed)
+        self.search_entry.connect('key-press-event', self._on_modal_key_press)
+        vbox.pack_start(self.search_entry, False, False, 0)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_vexpand(True)
+        vbox.pack_start(scrolled, True, True, 0)
+
+        self.list_box = Gtk.ListBox()
+        self.list_box.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.list_box.connect('row-activated', self._on_row_activated)
+        self.list_box.connect('key-press-event', self._on_modal_key_press)
+        scrolled.add(self.list_box)
+
+        self.hint_label = Gtk.Label(label=HINT_TEXT, xalign=0)
+        self.hint_label.set_line_wrap(True)
+        _add_class(self.hint_label, 'magere-brug-hint')
+        vbox.pack_start(self.hint_label, False, False, 0)
+
+        win.connect('key-press-event', self._on_modal_key_press)
+        win.connect('focus-out-event', self._on_window_focus_out)
+        win.connect('delete-event', self._on_delete)
+        win.connect('destroy', lambda *_a: self._on_window_destroyed())
+
+        self._placement.schedule(win, parent)
+
+    def _on_window_destroyed(self) -> None:
+        self._placement.cancel()
+        self.window = None
+        self.search_entry = None
+        self.list_box = None
+        self.hint_label = None
+        self._visible_rows = []
+
+    def _on_delete(self, *_args) -> bool:
+        self._close_navigator(refocus=self._source_terminal)
+        return True
+
+    def _on_window_focus_out(self, _window, _event) -> bool:
+        if self._focus_out_armed and not self._closing:
+            GLib.idle_add(self._maybe_close_on_focus_loss)
+        return False
+
+    def _maybe_close_on_focus_loss(self) -> bool:
+        if self._closing or self.window is None:
+            return False
+        try:
+            if self.window.get_visible() and not self.window.has_toplevel_focus():
+                self._close_navigator(refocus=self._source_terminal)
+        except Exception:
+            pass
+        return False
+
+    def _close_navigator(self, refocus=None) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self._placement.cancel()
+        self._focus_out_armed = False
+        win = self.window
+        if win is not None:
+            try:
+                win.hide()
+            except Exception:
+                try:
+                    win.destroy()
+                    self.window = None
+                except Exception:
+                    pass
+        self._closing = False
+        if refocus is not None:
+            GLib.idle_add(lambda t=refocus: self._focus_terminal(t) or False)
+
+    def _focus_terminal(self, term) -> None:
+        if term is None or not self._term_alive(term):
+            return
+        try:
+            top = term.get_toplevel()
+            if top and isinstance(top, Gtk.Window):
+                top.present()
+        except Exception:
+            pass
+        for target in (term, getattr(term, 'vte', None)):
+            if target is None:
+                continue
+            try:
+                target.grab_focus()
+            except Exception:
+                pass
+        self._note_mru(term)
+
+    # -------------------------------------------------------------- list UI
+
+    def _on_search_changed(self, _entry) -> None:
+        self._update_list_view()
+
+    def _update_list_view(self) -> None:
+        if not self.list_box:
+            return
+        for child in self.list_box.get_children():
+            self.list_box.remove(child)
+        self._visible_rows = []
+
+        query = self.search_entry.get_text().strip() if self.search_entry else ''
+        groups = filter_and_group(self.terminals_data, query)
+        current = self._current_terminal()
+
+        if not groups:
+            self._add_empty_row(
+                'No matching terminals' if query else 'No terminals found'
+            )
+            self.list_box.show_all()
+            return
+
+        index = 0
+        for group in groups.values():
+            self.list_box.add(self._make_header_row(group['title']))
+            for item in group['items']:
+                index += 1
+                row = self._make_term_row(item, current, index)
+                self.list_box.add(row)
+                self._visible_rows.append(row)
+
+        self.list_box.show_all()
+        if self._visible_rows:
+            self.list_box.select_row(self._visible_rows[0])
+            try:
+                if self.search_entry is not None:
+                    self.search_entry.grab_focus()
+            except Exception:
+                pass
+
+    def _add_empty_row(self, message: str) -> None:
+        row = Gtk.ListBoxRow()
+        row.set_selectable(False)
+        row.set_activatable(False)
+        lbl = Gtk.Label(label=message, xalign=0.5)
+        _add_class(lbl, 'magere-brug-empty')
+        lbl.set_margin_top(24)
+        lbl.set_margin_bottom(24)
+        row.add(lbl)
+        self.list_box.add(row)
+
+    def _make_header_row(self, title: str) -> Gtk.ListBoxRow:
+        header = Gtk.ListBoxRow()
+        header.set_selectable(False)
+        header.set_activatable(False)
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        hbox.set_margin_start(8)
+        hbox.set_margin_end(8)
+        hbox.set_margin_top(6)
+        hbox.set_margin_bottom(2)
+        hlbl = Gtk.Label(label=title, xalign=0)
+        _add_class(hlbl, 'magere-brug-header')
+        hbox.pack_start(hlbl, True, True, 0)
+        header.add(hbox)
+        return header
+
+    def _make_term_row(self, item, current, index: int) -> Gtk.ListBoxRow:
+        row = Gtk.ListBoxRow()
+        row.terminal_obj = item['object']
+        row.is_term_row = True
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        outer.set_margin_start(10)
+        outer.set_margin_end(10)
+        outer.set_margin_top(6)
+        outer.set_margin_bottom(6)
+
+        if index <= 9:
+            idx_lbl = Gtk.Label(label=str(index), xalign=0.5)
+            _add_class(idx_lbl, 'magere-brug-row-index')
+            outer.pack_start(idx_lbl, False, False, 0)
+
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        is_current = current is not None and item['object'] is current
+        title_esc = GLib.markup_escape_text(item['title'])
+        if is_current:
+            markup = (
+                '<span font_weight="bold">%s</span>  '
+                '<span size="small" alpha="60%%">current</span>' % title_esc
+            )
+        else:
+            markup = title_esc
+
+        lbl_title = Gtk.Label(xalign=0)
+        lbl_title.set_use_markup(True)
+        lbl_title.set_markup(markup)
+        lbl_title.set_ellipsize(Pango.EllipsizeMode.END)
+        if is_current:
+            _add_class(lbl_title, 'magere-brug-current-title')
+
+        lbl_ctx = Gtk.Label(label=item['context'], xalign=0)
+        lbl_ctx.set_ellipsize(Pango.EllipsizeMode.END)
+        _add_class(lbl_ctx, 'magere-brug-muted')
+
+        col.pack_start(lbl_title, True, True, 0)
+        col.pack_start(lbl_ctx, True, True, 0)
+        outer.pack_start(col, True, True, 0)
+        row.add(outer)
+        return row
+
+    # ----------------------------------------------------------- navigation
+
+    def _selected_term_row(self) -> Optional[Gtk.ListBoxRow]:
+        if not self.list_box:
+            return None
+        row = self.list_box.get_selected_row()
+        if row is not None and getattr(row, 'is_term_row', False):
+            return row
+        return self._visible_rows[0] if self._visible_rows else None
+
+    def _move_selection(self, delta: int) -> None:
+        if not self._visible_rows or not self.list_box:
+            return
+        current = self.list_box.get_selected_row()
+        try:
+            idx = self._visible_rows.index(current)
+        except ValueError:
+            idx = 0
+        idx = max(0, min(len(self._visible_rows) - 1, idx + delta))
+        row = self._visible_rows[idx]
+        self.list_box.select_row(row)
+        try:
+            if self.search_entry is not None:
+                self.search_entry.grab_focus()
+                self.search_entry.set_position(-1)
+        except Exception:
+            pass
+        self._ensure_row_visible(row)
+
+    def _ensure_row_visible(self, row: Gtk.ListBoxRow) -> None:
+        try:
+            parent = self.list_box.get_parent()
+            if not isinstance(parent, Gtk.ScrolledWindow):
+                return
+            adj = parent.get_vadjustment()
+            if adj is None:
+                return
+            alloc = row.get_allocation()
+            value, page = adj.get_value(), adj.get_page_size()
+            top, bottom = alloc.y, alloc.y + alloc.height
+            if top < value:
+                adj.set_value(top)
+            elif bottom > value + page:
+                adj.set_value(bottom - page)
+        except Exception:
+            pass
+
+    def _activate_index(self, one_based: int) -> bool:
+        if one_based < 1 or one_based > len(self._visible_rows):
+            return False
+        row = self._visible_rows[one_based - 1]
+        self.list_box.select_row(row)
+        self._on_row_activated(self.list_box, row)
+        return True
+
+    def _on_row_activated(self, _listbox, row) -> None:
+        if not getattr(row, 'is_term_row', False):
+            return
+        self._close_navigator(refocus=getattr(row, 'terminal_obj', None))
+
+    def _on_modal_key_press(self, _widget, event) -> bool:
+        keyval = event.keyval
+        mods = event.state & Gtk.accelerator_get_default_mod_mask()
+
+        if keyval == Gdk.KEY_Escape:
+            self._close_navigator(refocus=self._source_terminal)
+            return True
+
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self._handle_enter()
+            return True
+
+        if keyval in (Gdk.KEY_Down, Gdk.KEY_KP_Down):
+            self._move_selection(1)
+            return True
+        if keyval in (Gdk.KEY_Up, Gdk.KEY_KP_Up):
+            self._move_selection(-1)
+            return True
+        if keyval == Gdk.KEY_Page_Down:
+            self._move_selection(5)
+            return True
+        if keyval == Gdk.KEY_Page_Up:
+            self._move_selection(-5)
+            return True
+        if keyval == Gdk.KEY_Home and mods:
+            self._move_selection(-(10 ** 6))
+            return True
+        if keyval == Gdk.KEY_End and mods:
+            self._move_selection(10 ** 6)
+            return True
+
+        query = self.search_entry.get_text() if self.search_entry else ''
+        if not query and mods == 0:
+            digit = None
+            if Gdk.KEY_1 <= keyval <= Gdk.KEY_9:
+                digit = keyval - Gdk.KEY_0
+            elif Gdk.KEY_KP_1 <= keyval <= Gdk.KEY_KP_9:
+                digit = keyval - Gdk.KEY_KP_0
+            if digit is not None and self._activate_index(digit):
+                return True
+
+        return False
+
+    def _handle_enter(self) -> None:
+        query = self.search_entry.get_text().strip() if self.search_entry else ''
+        row = self._selected_term_row()
+        first = self._visible_rows[0] if self._visible_rows else None
+
+        if not query:
+            prev = self._previous_terminal(self._source_terminal)
+            if row is not None and first is not None and row is not first:
+                self._on_row_activated(self.list_box, row)
+            elif prev is not None:
+                self._close_navigator(refocus=prev)
+            elif row is not None:
+                self._on_row_activated(self.list_box, row)
+            else:
+                self._close_navigator(refocus=self._source_terminal)
+            return
+
+        if row is not None:
+            self._on_row_activated(self.list_box, row)
+        else:
+            self._close_navigator(refocus=self._source_terminal)

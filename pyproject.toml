@@ -1,0 +1,21 @@
+[project]
+name = "magere-brug"
+version = "1.0.0"
+description = "Quick terminal switcher plugin for Terminator"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [{ name = "magereBrug contributors" }]
+keywords = ["terminator", "plugin", "terminal", "switcher"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Environment :: X11 Applications :: GTK",
+  "Topic :: Terminals",
+]
+
+# Runtime deps (Terminator + PyGObject) are provided by the host system.
+# This project is installed by copying into Terminator's plugins directory.
+
+[tool.unittest]
+# run: python3 -m unittest discover -s tests -v
