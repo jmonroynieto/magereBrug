@@ -16,6 +16,7 @@ from magere_brug.util import (  # noqa: E402
     filter_and_group,
     first_attr,
     fuzzy_score,
+    sanitize_title,
     shorten_path,
 )
 
@@ -118,6 +119,23 @@ class TestFirstAttr(unittest.TestCase):
 
     def test_missing(self):
         self.assertIsNone(first_attr(object(), ('nope',)))
+
+
+class TestSanitizeTitle(unittest.TestCase):
+    def test_strips_control_chars(self):
+        self.assertEqual(sanitize_title('a\nb\tc'), 'abc')
+
+    def test_strips_whitespace_ends(self):
+        self.assertEqual(sanitize_title('  hello  '), 'hello')
+
+    def test_truncates_with_ellipsis(self):
+        text = 'x' * 100
+        result = sanitize_title(text, max_len=10)
+        self.assertEqual(result, 'xxxxxxx...')
+        self.assertEqual(len(result), 10)
+
+    def test_short_text_unchanged(self):
+        self.assertEqual(sanitize_title('short', max_len=60), 'short')
 
 
 class TestCmdline(unittest.TestCase):

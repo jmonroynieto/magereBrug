@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import gi
 
@@ -28,6 +28,7 @@ from magere_brug.constants import (
     NAV_HEIGHT,
     NAV_WIDTH,
     PLUGIN_NAME,
+    RENAME_MAX_LEN,
 )
 from magere_brug.css import NAV_CSS
 from magere_brug.placement import PlacementController
@@ -35,6 +36,7 @@ from magere_brug.util import (
     cmdline_for_pid,
     filter_and_group,
     first_attr,
+    sanitize_title,
     shorten_path,
 )
 
@@ -92,6 +94,12 @@ class MagereBrug(plugin.MenuItem):
         self._focus_out_armed = False
         self._closing = False
 
+        # Parsed hotkey cache; refreshed on the hook timer (HOOK_INTERVAL_MS),
+        # not on every keypress — config re-reads are otherwise paid on every
+        # key press in every terminal.
+        self._cached_accel_str: Optional[str] = None
+        self._cached_accel: Tuple[Optional[int], Optional[int]] = (None, None)
+
         GLib.idle_add(self._deferred_setup)
 
     # ---------------------------------------------------------------- lifecycle
@@ -99,6 +107,7 @@ class MagereBrug(plugin.MenuItem):
     def _deferred_setup(self) -> bool:
         dbg('magereBrug: plugin setup')
         self._ensure_css()
+        self._refresh_keybinding_cache()
         self._hook_timeout_id = GLib.timeout_add(
             HOOK_INTERVAL_MS, self._hook_terminal_listeners
         )
@@ -163,12 +172,25 @@ class MagereBrug(plugin.MenuItem):
                 return str(val).strip()
         return DEFAULT_KEYBINDING
 
-    def _event_matches_hotkey(self, event) -> bool:
-        keyval, mods = _parse_accel(self._keybinding_accel())
+    def _refresh_keybinding_cache(self) -> None:
+        """Re-parse the configured accelerator; cheap, so call it from the
+        existing hook timer rather than per keypress (see _cached_accel)."""
+        accel_str = self._keybinding_accel()
+        if accel_str == self._cached_accel_str and self._cached_accel[0] is not None:
+            return
+        keyval, mods = _parse_accel(accel_str)
         if keyval is None:
             keyval, mods = _parse_accel(DEFAULT_KEYBINDING)
+        self._cached_accel_str = accel_str
+        self._cached_accel = (keyval, mods)
+
+    def _event_matches_hotkey(self, event) -> bool:
+        keyval, mods = self._cached_accel
         if keyval is None:
-            return False
+            self._refresh_keybinding_cache()
+            keyval, mods = self._cached_accel
+            if keyval is None:
+                return False
         mask = Gtk.accelerator_get_default_mod_mask()
         return (
             Gdk.keyval_to_lower(event.keyval) == Gdk.keyval_to_lower(keyval)
@@ -186,6 +208,7 @@ class MagereBrug(plugin.MenuItem):
 
     def _hook_terminal_listeners(self) -> bool:
         try:
+            self._refresh_keybinding_cache()
             for term in self._all_terminals():
                 self._hook_one_terminal(term)
             self._hook_windows()
@@ -203,14 +226,17 @@ class MagereBrug(plugin.MenuItem):
             if top is None or id(top) in seen:
                 continue
             seen.add(id(top))
-            if getattr(top, '_magere_brug_win_bound', False):
+            # Owner-tagged (not a bare bool) so a plugin reload that skips
+            # unload() still rebinds under the new instance instead of
+            # silently finding the terminal "already hooked".
+            if getattr(top, '_magere_brug_win_bound_owner', None) is self:
                 continue
             try:
                 top.connect(
                     'add',
                     lambda *_a: GLib.timeout_add(100, self._hook_once),
                 )
-                top._magere_brug_win_bound = True
+                top._magere_brug_win_bound_owner = self
             except Exception:
                 pass
 
@@ -222,23 +248,27 @@ class MagereBrug(plugin.MenuItem):
         vte = getattr(term, 'vte', None)
         if vte is None:
             return
-        if not getattr(vte, '_magere_brug_bound', False):
+        # Bound flags are tagged with the owning plugin instance rather than
+        # a bare bool: if Terminator ever re-instantiates the plugin without
+        # calling unload() first, a stale flag from the old instance must not
+        # cause the new instance to skip binding its own handler.
+        if getattr(vte, '_magere_brug_bound_owner', None) is not self:
             try:
                 vte.connect('key-press-event', self._on_vte_key_press)
-                vte._magere_brug_bound = True
+                vte._magere_brug_bound_owner = self
             except Exception as exc:
                 err('magereBrug bind key: %s' % exc)
-        if not getattr(term, '_magere_brug_focus_bound', False):
+        if getattr(term, '_magere_brug_focus_bound_owner', None) is not self:
             try:
                 term.connect('focus-in-event', self._on_terminal_focus_in)
-                term._magere_brug_focus_bound = True
+                term._magere_brug_focus_bound_owner = self
             except Exception:
                 try:
                     vte.connect(
                         'focus-in-event',
                         lambda _w, _e, t=term: self._note_mru(t) or False,
                     )
-                    term._magere_brug_focus_bound = True
+                    term._magere_brug_focus_bound_owner = self
                 except Exception as exc:
                     err('magereBrug bind focus: %s' % exc)
         if term not in self._mru:
@@ -246,18 +276,18 @@ class MagereBrug(plugin.MenuItem):
 
     def _unhook_terminal(self, term) -> None:
         vte = getattr(term, 'vte', None)
-        if vte and getattr(vte, '_magere_brug_bound', False):
+        if vte is not None and getattr(vte, '_magere_brug_bound_owner', None) is self:
             try:
                 vte.disconnect_by_func(self._on_vte_key_press)
             except (TypeError, AttributeError):
                 pass
-            vte._magere_brug_bound = False
-        if getattr(term, '_magere_brug_focus_bound', False):
+            vte._magere_brug_bound_owner = None
+        if getattr(term, '_magere_brug_focus_bound_owner', None) is self:
             try:
                 term.disconnect_by_func(self._on_terminal_focus_in)
             except (TypeError, AttributeError):
                 pass
-            term._magere_brug_focus_bound = False
+            term._magere_brug_focus_bound_owner = None
 
     def _on_terminal_focus_in(self, term, _event) -> bool:
         self._note_mru(term)
@@ -894,7 +924,7 @@ class MagereBrug(plugin.MenuItem):
         if term is None or self.rename_entry is None:
             self._exit_rename_mode(focus_search=True)
             return False
-        name = self.rename_entry.get_text().strip()
+        name = sanitize_title(self.rename_entry.get_text(), RENAME_MAX_LEN)
         ok = self._set_terminal_title(term, name)
         if not ok:
             err('magereBrug: could not set terminal title')

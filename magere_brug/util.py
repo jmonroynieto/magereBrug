@@ -44,6 +44,15 @@ def cmdline_for_pid(pid: Any, max_len: int = 60) -> Optional[str]:
         return None
 
 
+def sanitize_title(text: str, max_len: int = 60) -> str:
+    """Strip control characters and cap length for a user-typed title."""
+    cleaned = ''.join(ch for ch in text if ch.isprintable())
+    cleaned = cleaned.strip()
+    if len(cleaned) > max_len:
+        return cleaned[: max_len - 3] + '...'
+    return cleaned
+
+
 def fuzzy_score(query: str, text: str) -> Optional[int]:
     """Subsequence fuzzy score; higher is better. None means no match.
 

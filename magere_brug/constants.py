@@ -27,5 +27,9 @@ FOCUS_OUT_ARM_MS = 200
 
 HINT_TEXT = '↑↓ select   F2 rename   1–9 jump   Enter open   Esc close'
 
+# Cap on a user-typed custom title (rename bar); guards against pasted
+# giant strings blowing out row width or embedding control characters.
+RENAME_MAX_LEN = 80
+
 # Word-boundary characters for fuzzy scoring.
 WORD_BOUNDARY = ' /.-_[]'
