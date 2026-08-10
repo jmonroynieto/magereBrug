@@ -72,6 +72,23 @@ _state: Dict[str, Any] = {
 }
 
 
+def _quiet_by_default() -> None:
+    """Silence our tree until :func:`configure` runs.
+
+    Without a handler, stdlib logging falls back to ``lastResort``, which
+    prints WARNING and above to stderr — the exact behaviour this module
+    exists to replace. Propagation is off so we never reach the app's root
+    logger either.
+    """
+    root = logging.getLogger(LOGGER_ROOT)
+    root.propagate = False
+    if not root.handlers:
+        root.addHandler(logging.NullHandler())
+
+
+_quiet_by_default()
+
+
 # ------------------------------------------------------------------- paths
 
 
@@ -311,6 +328,7 @@ def reset() -> None:
             'slow_ms': DEFAULT_SLOW_MS,
         }
     )
+    _quiet_by_default()
 
 
 # ------------------------------------------------------------------ clocks

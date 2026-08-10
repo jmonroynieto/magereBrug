@@ -79,7 +79,10 @@ Examples:
 - `<Primary><Shift>p` — Ctrl+Shift+P
 - `<Alt>grave` — Alt+\`
 
-The binding is re-read periodically (every 1.5s) — no restart needed for the string.
+The binding is re-read every 1.5s, so changes made through **Preferences**
+apply without a restart. Hand-edits to the config *file* do need a Terminator
+restart: Terminator parses the file once at startup and serves every later
+read from that in-memory copy.
 
 ## Keyboard
 

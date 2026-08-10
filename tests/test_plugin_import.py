@@ -134,5 +134,54 @@ class TestPluginImport(unittest.TestCase):
         self.assertFalse(PlacementController().place(None, None))
 
 
+class TestConfigCaching(unittest.TestCase):
+    """Terminator's Config() constructor is expensive; we must build one.
+
+    Each construction runs connect_gsetting_callbacks(): two Gio.Settings
+    objects plus three signal connects. The keybinding refresh runs on a 1.5s
+    timer, so one Config per call meant that churn twice a second forever.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._saved = install_stubs()
+        from magere_brug import plugin as plugin_module
+
+        cls.plugin_module = plugin_module
+
+    @classmethod
+    def tearDownClass(cls):
+        restore_stubs(cls._saved)
+
+    def setUp(self):
+        self.plugin_module.Config.reset_mock()
+        self.instance = self.plugin_module.MagereBrug()
+
+    def test_config_is_constructed_at_most_once(self):
+        for _ in range(20):
+            self.instance._plugin_config()
+        self.assertEqual(self.plugin_module.Config.call_count, 1)
+
+    def test_repeated_keybinding_refresh_does_not_rebuild_config(self):
+        for _ in range(20):
+            self.instance._refresh_keybinding_cache()
+        self.assertLessEqual(self.plugin_module.Config.call_count, 1)
+
+    def test_missing_config_class_is_tolerated(self):
+        saved = self.plugin_module.Config
+        try:
+            self.plugin_module.Config = None
+            self.assertEqual(self.plugin_module.MagereBrug()._plugin_config(), {})
+        finally:
+            self.plugin_module.Config = saved
+
+    def test_falls_back_to_default_keybinding(self):
+        # The stub Config returns MagicMocks, not dicts, so no section is found.
+        self.assertEqual(
+            self.instance._keybinding_accel(),
+            self.plugin_module.DEFAULT_KEYBINDING,
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

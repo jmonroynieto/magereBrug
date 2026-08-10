@@ -107,6 +107,7 @@ class MagereBrug(plugin.MenuItem):
         # key press in every terminal.
         self._cached_accel_str: Optional[str] = None
         self._cached_accel: Tuple[Optional[int], Optional[int]] = (None, None)
+        self._config = None  # see _get_config()
 
         # Diagnostics. The watchdog measures main-loop responsiveness; the
         # tick counter paces the (cheap but not free) RSS sampling.
@@ -255,11 +256,33 @@ class MagereBrug(plugin.MenuItem):
 
     # ---------------------------------------------------------- config / keys
 
-    def _plugin_config(self) -> dict:
+    def _get_config(self):
+        """One cached Terminator ``Config``, built at most once per session.
+
+        ``Config()`` is not the cheap accessor it looks like: its constructor
+        calls ``connect_gsetting_callbacks()``, which creates two
+        ``Gio.Settings`` objects and connects three signal handlers — every
+        time. Constructing one per keybinding refresh meant doing that twice a
+        second for the life of the process, each instance holding live dconf
+        watches in a reference cycle until the cyclic collector got to it.
+
+        Caching costs nothing in freshness: the underlying ``ConfigBase`` is a
+        Borg whose ``load()`` short-circuits once loaded, so every instance
+        reads the same in-memory tree regardless. Changes made through
+        Preferences still land, because they mutate that shared tree.
+        """
         if Config is None:
-            return {}
+            return None
+        if self._config is None:
+            with log.span('config.construct'):
+                self._config = Config()
+        return self._config
+
+    def _plugin_config(self) -> dict:
         try:
-            cfg = Config()
+            cfg = self._get_config()
+            if cfg is None:
+                return {}
             if hasattr(cfg, 'plugin_get_config'):
                 section = cfg.plugin_get_config(PLUGIN_NAME)
                 if isinstance(section, dict):
@@ -274,6 +297,7 @@ class MagereBrug(plugin.MenuItem):
                 if isinstance(section, dict):
                     return section
         except Exception as exc:
+            log.exception('config.read_failed')
             err('magereBrug config: %s' % exc)
         return {}
 
@@ -286,16 +310,22 @@ class MagereBrug(plugin.MenuItem):
         return DEFAULT_KEYBINDING
 
     def _refresh_keybinding_cache(self) -> None:
-        """Re-parse the configured accelerator; cheap, so call it from the
-        existing hook timer rather than per keypress (see _cached_accel)."""
+        """Re-parse the configured accelerator.
+
+        Called from the hook timer rather than per keypress; with the config
+        instance cached this is a dict lookup, so it stays off the key path
+        without costing anything on the timer.
+        """
         accel_str = self._keybinding_accel()
         if accel_str == self._cached_accel_str and self._cached_accel[0] is not None:
             return
         keyval, mods = _parse_accel(accel_str)
         if keyval is None:
+            log.warn('keybinding.unparseable', accel=accel_str)
             keyval, mods = _parse_accel(DEFAULT_KEYBINDING)
         self._cached_accel_str = accel_str
         self._cached_accel = (keyval, mods)
+        log.debug('keybinding.updated', accel=accel_str)
 
     def _event_matches_hotkey(self, event) -> bool:
         keyval, mods = self._cached_accel

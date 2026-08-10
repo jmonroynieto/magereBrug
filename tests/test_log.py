@@ -94,6 +94,25 @@ class TestPathResolution(LogTestCase):
         mblog.get_logger('t').warn('still.alive')
 
 
+class TestQuietBeforeConfigure(LogTestCase):
+    def test_logging_before_configure_does_not_reach_stderr(self):
+        """Without a handler, stdlib logging prints to stderr via lastResort.
+
+        That is precisely the behaviour this module replaces, so the tree must
+        start with a NullHandler attached and propagation off.
+        """
+        import io
+        from contextlib import redirect_stderr
+
+        buffer = io.StringIO()
+        with redirect_stderr(buffer):
+            mblog.get_logger('early').warn('before.configure')
+        self.assertEqual(buffer.getvalue(), '')
+
+    def test_tree_is_isolated_from_the_root_logger(self):
+        self.assertFalse(logging.getLogger(mblog.LOGGER_ROOT).propagate)
+
+
 class TestLevelResolution(LogTestCase):
     def test_default_is_warning(self):
         self.assertEqual(mblog.resolve_level(), logging.WARNING)
