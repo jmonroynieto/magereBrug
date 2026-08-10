@@ -156,6 +156,10 @@ PID, because one file collects every Terminator process and plugin reload:
 
 ### What to look for
 
+[DEBUGGING.md](DEBUGGING.md) has the standing suspect list for the freezes —
+what each theory predicts, which log lines confirm or refute it, and what to
+change if one is confirmed. Start there when a freeze happens.
+
 | Event | Meaning |
 |-------|---------|
 | `mainloop.stall` | The GTK main loop was blocked. `max_ms` is how long — this is a freeze, measured. |
