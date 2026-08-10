@@ -20,6 +20,7 @@ try:
 except Exception:  # pragma: no cover
     Config = None  # type: ignore
 
+from magere_brug import __version__
 from magere_brug.constants import (
     DEFAULT_KEYBINDING,
     FOCUS_OUT_ARM_MS,
@@ -29,8 +30,13 @@ from magere_brug.constants import (
     NAV_WIDTH,
     PLUGIN_NAME,
     RENAME_MAX_LEN,
+    RSS_SAMPLE_EVERY,
+    WATCHDOG_INTERVAL_MS,
+    WATCHDOG_SUMMARY_MS,
+    WATCHDOG_THRESHOLD_MS,
 )
 from magere_brug.css import NAV_CSS
+from magere_brug import log as mblog
 from magere_brug.placement import PlacementController
 from magere_brug.util import (
     cmdline_for_pid,
@@ -39,6 +45,8 @@ from magere_brug.util import (
     sanitize_title,
     shorten_path,
 )
+
+log = mblog.get_logger('plugin')
 
 
 def _add_class(widget: Gtk.Widget, name: str) -> None:
@@ -100,24 +108,87 @@ class MagereBrug(plugin.MenuItem):
         self._cached_accel_str: Optional[str] = None
         self._cached_accel: Tuple[Optional[int], Optional[int]] = (None, None)
 
+        # Diagnostics. The watchdog measures main-loop responsiveness; the
+        # tick counter paces the (cheap but not free) RSS sampling.
+        self._watchdog_timeout_id: Optional[int] = None
+        self._stalls = mblog.StallDetector(
+            interval_ms=WATCHDOG_INTERVAL_MS,
+            threshold_ms=WATCHDOG_THRESHOLD_MS,
+            summary_ms=WATCHDOG_SUMMARY_MS,
+        )
+        self._watchdog_ticks = 0
+        self._hook_ticks = 0
+        self._opens = 0
+        self._rehook_pending_id: Optional[int] = None
+
         GLib.idle_add(self._deferred_setup)
 
     # ---------------------------------------------------------------- lifecycle
 
+    def _start_logging(self) -> None:
+        """Bring up the log before anything else can want to write to it.
+
+        The level is resolved from config exactly once here — reading it per
+        call site would drag a Terminator ``Config()`` construction onto the
+        main loop, which is precisely the cost we are hunting.
+        """
+        section = self._plugin_config()
+        path = mblog.configure(
+            level=section.get('log_level') if section else None,
+            debug=section.get('debug') if section else None,
+        )
+        fields = mblog.session_fields()
+        fields.update(version=__version__, log_file=path or '<none>')
+        error = mblog.setup_error()
+        if error:
+            fields['setup_error'] = error
+            err('magereBrug: file logging unavailable (%s)' % error)
+        # Session start/end markers let `diagnose` spot a session that ended
+        # without a shutdown line — the signature of a hard crash, which is
+        # otherwise invisible because a GTK/VTE segfault logs nothing.
+        log.warn(mblog.EVENT_SESSION_START, **fields)
+
     def _deferred_setup(self) -> bool:
         dbg('magereBrug: plugin setup')
+        self._start_logging()
         self._ensure_css()
         self._refresh_keybinding_cache()
         self._hook_timeout_id = GLib.timeout_add(
             HOOK_INTERVAL_MS, self._hook_terminal_listeners
         )
+        self._watchdog_timeout_id = GLib.timeout_add(
+            WATCHDOG_INTERVAL_MS, self._on_watchdog_tick
+        )
         self._hook_terminal_listeners()
+        log.debug('setup.complete', hook_interval_ms=HOOK_INTERVAL_MS)
         return False
 
+    def _on_watchdog_tick(self) -> bool:
+        """Heartbeat: late firing means the main loop was blocked."""
+        report = self._stalls.tick()
+        if report is not None:
+            log.warn('mainloop.stall', **report)
+        self._watchdog_ticks += 1
+        if self._watchdog_ticks % RSS_SAMPLE_EVERY == 0:
+            log.debug(
+                'process.rss',
+                rss_kb=mblog.rss_kb(),
+                hook_ticks=self._hook_ticks,
+                opens=self._opens,
+                terminals=len(self._all_terminals()),
+                mru=len(self._mru),
+            )
+        return True
+
     def unload(self) -> None:
-        if self._hook_timeout_id is not None:
-            GLib.source_remove(self._hook_timeout_id)
-            self._hook_timeout_id = None
+        for attr in ('_hook_timeout_id', '_watchdog_timeout_id', '_rehook_pending_id'):
+            source_id = getattr(self, attr, None)
+            if source_id is not None:
+                try:
+                    GLib.source_remove(source_id)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
         self._placement.cancel()
         if self.window is not None:
             try:
@@ -129,7 +200,14 @@ class MagereBrug(plugin.MenuItem):
             for term in self._all_terminals():
                 self._unhook_terminal(term)
         except Exception as exc:
+            log.exception('unload.unhook_failed')
             err('magereBrug unload: %s' % exc)
+        log.warn(
+            mblog.EVENT_SESSION_END,
+            opens=self._opens,
+            hook_ticks=self._hook_ticks,
+            rss_kb=mblog.rss_kb(),
+        )
 
     def callback(self, menuitems, menu, terminal) -> None:
         """Add the navigator item to the terminal context menu (3-arg API)."""
@@ -139,6 +217,41 @@ class MagereBrug(plugin.MenuItem):
             lambda _w: self.toggle_navigator(source_terminal=terminal),
         )
         menuitems.append(item)
+
+        diag = Gtk.MenuItem.new_with_mnemonic('magereBrug _Diagnostics...')
+        diag.connect('activate', lambda _w: self._show_diagnostics(terminal))
+        menuitems.append(diag)
+
+    def _show_diagnostics(self, terminal=None) -> None:
+        """Print the log location and a one-line health summary into the terminal.
+
+        Deliberately writes into the user's own terminal rather than opening a
+        dialog: it is the shortest path from "something froze" to a copyable
+        log path, and it works even when the navigator window itself is broken.
+        """
+        path = mblog.log_path() or '<file logging unavailable>'
+        lines = [
+            'magereBrug %s — diagnostics' % __version__,
+            '  log file : %s' % path,
+            '  level    : set MAGEREBRUG_LOG_LEVEL=DEBUG (or debug=True in config)',
+            '  report   : python3 -m magere_brug.diagnose',
+            '  live tail: python3 -m magere_brug.diagnose --follow',
+            '  opens=%d hook_ticks=%d terminals=%d rss_kb=%s'
+            % (
+                self._opens,
+                self._hook_ticks,
+                len(self._all_terminals()),
+                mblog.rss_kb(),
+            ),
+        ]
+        log.warn('diagnostics.requested', log_file=path)
+        text = '\n'.join(lines) + '\n'
+        vte = getattr(terminal, 'vte', None) if terminal is not None else None
+        with log.swallow('diagnostics.feed'):
+            if vte is not None and hasattr(vte, 'feed'):
+                vte.feed(text.replace('\n', '\r\n').encode('utf-8'))
+                return
+        err(text)
 
     # ---------------------------------------------------------- config / keys
 
@@ -207,12 +320,19 @@ class MagereBrug(plugin.MenuItem):
             return []
 
     def _hook_terminal_listeners(self) -> bool:
+        # Runs every HOOK_INTERVAL_MS on the main thread, forever. Anything
+        # expensive in here is felt as a periodic hitch, so it is spanned.
+        self._hook_ticks += 1
         try:
-            self._refresh_keybinding_cache()
-            for term in self._all_terminals():
-                self._hook_one_terminal(term)
-            self._hook_windows()
+            with log.span('hook.tick') as span:
+                self._refresh_keybinding_cache()
+                terminals = self._all_terminals()
+                for term in terminals:
+                    self._hook_one_terminal(term)
+                self._hook_windows()
+                span['terminals'] = len(terminals)
         except Exception as exc:
+            log.exception('hook.tick_failed')
             err('magereBrug hook listeners: %s' % exc)
         return True
 
@@ -231,16 +351,25 @@ class MagereBrug(plugin.MenuItem):
             # silently finding the terminal "already hooked".
             if getattr(top, '_magere_brug_win_bound_owner', None) is self:
                 continue
-            try:
-                top.connect(
-                    'add',
-                    lambda *_a: GLib.timeout_add(100, self._hook_once),
-                )
+            with log.swallow('hook.window_bind'):
+                top.connect('add', self._on_window_add)
                 top._magere_brug_win_bound_owner = self
-            except Exception:
-                pass
+                log.debug('hook.window_bound')
+
+    def _on_window_add(self, *_args) -> None:
+        """A widget was added to a Terminator window — rescan for new terminals.
+
+        'add' fires for every widget in a split, so one user action can emit a
+        burst. Coalesce into a single pending rescan; the previous version
+        queued an independent 100ms timeout per signal, each running a full
+        hook pass.
+        """
+        if self._rehook_pending_id is not None:
+            return
+        self._rehook_pending_id = GLib.timeout_add(100, self._hook_once)
 
     def _hook_once(self) -> bool:
+        self._rehook_pending_id = None
         self._hook_terminal_listeners()
         return False
 
@@ -318,11 +447,13 @@ class MagereBrug(plugin.MenuItem):
             if len(self._all_terminals()) <= 1:
                 return False
             source = self._terminal_for_vte(widget)
+            log.debug('hotkey.matched')
             GLib.idle_add(
                 lambda s=source: self.toggle_navigator(source_terminal=s) or False
             )
             return True
         except Exception as exc:
+            log.exception('keypress.failed')
             err('magereBrug keypress: %s' % exc)
         return False
 
@@ -429,34 +560,42 @@ class MagereBrug(plugin.MenuItem):
             return 10 ** 6
 
     def _gather_terminals(self) -> None:
+        # Reads /proc for every terminal (cmdline_for_pid) — cheap per call,
+        # but it is on the open path, so a laggy navigator shows up here.
         self.terminals_data = []
         try:
-            live = self._all_terminals()
-            self._mru = [t for t in self._mru if t in live]
-            for term in live:
-                if term not in self._mru:
-                    self._mru.append(term)
-                title = self._terminal_title(term)
-                cwd = self._terminal_cwd(term)
-                cmd = self._terminal_command(term)
-                win_title = self._window_title_for_term(term)
-                bits = [b for b in (cwd, cmd if cmd != title else None) if b]
-                detail = ' · '.join(bits) if bits else 'Idle'
-                self.terminals_data.append({
-                    'object': term,
-                    'title': title,
-                    'context': '[%s] %s' % (win_title, detail),
-                    'cwd': cwd,
-                    'cmd': cmd,
-                    'win_title': win_title,
-                    'win_key': self._window_key_for_term(term),
-                    'search': ' '.join(
-                        x for x in (title, win_title, cwd or '', cmd or '', detail) if x
-                    ),
-                    'mru_index': self._mru_index(term),
-                })
+            with log.span('gather_terminals') as span:
+                self._gather_terminals_inner()
+                span['count'] = len(self.terminals_data)
         except Exception as exc:
+            log.exception('gather_terminals.failed')
             err('magereBrug gather terminals: %s' % exc)
+
+    def _gather_terminals_inner(self) -> None:
+        live = self._all_terminals()
+        self._mru = [t for t in self._mru if t in live]
+        for term in live:
+            if term not in self._mru:
+                self._mru.append(term)
+            title = self._terminal_title(term)
+            cwd = self._terminal_cwd(term)
+            cmd = self._terminal_command(term)
+            win_title = self._window_title_for_term(term)
+            bits = [b for b in (cwd, cmd if cmd != title else None) if b]
+            detail = ' · '.join(bits) if bits else 'Idle'
+            self.terminals_data.append({
+                'object': term,
+                'title': title,
+                'context': '[%s] %s' % (win_title, detail),
+                'cwd': cwd,
+                'cmd': cmd,
+                'win_title': win_title,
+                'win_key': self._window_key_for_term(term),
+                'search': ' '.join(
+                    x for x in (title, win_title, cwd or '', cmd or '', detail) if x
+                ),
+                'mru_index': self._mru_index(term),
+            })
 
     def _resolve_parent_window(self, source_terminal=None) -> Optional[Gtk.Window]:
         candidates = []
@@ -486,16 +625,25 @@ class MagereBrug(plugin.MenuItem):
                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
             )
             self._css_provider = provider
+            log.debug('css.installed')
         except Exception as exc:
+            log.exception('css.failed')
             err('magereBrug css: %s' % exc)
 
     # ----------------------------------------------------------- open / close
 
     def toggle_navigator(self, source_terminal=None) -> None:
         if self.window is not None and self.window.get_visible():
+            log.debug('navigator.toggle_close')
             self._close_navigator(refocus=self._source_terminal or source_terminal)
             return
 
+        self._opens += 1
+        with log.span('navigator.open') as span:
+            self._open_navigator(source_terminal)
+            span['open_count'] = self._opens
+
+    def _open_navigator(self, source_terminal=None) -> None:
         self._source_terminal = source_terminal or self._current_terminal()
         if self._source_terminal is not None:
             self._note_mru(self._source_terminal)
@@ -685,20 +833,18 @@ class MagereBrug(plugin.MenuItem):
 
     def _focus_terminal(self, term) -> None:
         if term is None or not self._term_alive(term):
+            log.debug('focus.skipped_dead')
             return
-        try:
-            top = term.get_toplevel()
-            if top and isinstance(top, Gtk.Window):
-                top.present()
-        except Exception:
-            pass
-        for target in (term, getattr(term, 'vte', None)):
-            if target is None:
-                continue
-            try:
-                target.grab_focus()
-            except Exception:
-                pass
+        with log.span('focus_terminal'):
+            with log.swallow('focus.present'):
+                top = term.get_toplevel()
+                if top and isinstance(top, Gtk.Window):
+                    top.present()
+            for target in (term, getattr(term, 'vte', None)):
+                if target is None:
+                    continue
+                with log.swallow('focus.grab'):
+                    target.grab_focus()
         self._note_mru(term)
 
     # -------------------------------------------------------------- list UI
@@ -926,7 +1072,9 @@ class MagereBrug(plugin.MenuItem):
             return False
         name = sanitize_title(self.rename_entry.get_text(), RENAME_MAX_LEN)
         ok = self._set_terminal_title(term, name)
+        log.debug('rename.commit', ok=ok, length=len(name))
         if not ok:
+            log.warn('rename.failed', length=len(name))
             err('magereBrug: could not set terminal title')
         # Refresh list so the new title shows; stay in the navigator.
         self._gather_terminals()

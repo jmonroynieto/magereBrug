@@ -7,6 +7,9 @@ from typing import Any, List, Optional, Tuple
 from gi.repository import Gdk, GLib, Gtk
 
 from magere_brug.constants import NAV_HEIGHT, NAV_WIDTH, PLACE_RETRY_MS
+from magere_brug.log import get_logger
+
+log = get_logger('placement')
 
 
 class PlacementController:
@@ -14,6 +17,12 @@ class PlacementController:
 
     Window managers often ignore a single ``move()``; this re-asserts position
     across map/allocate/idle/timeouts, then disconnects.
+
+    ``place()`` is called from a ``size-allocate`` handler and itself calls
+    ``resize()``/``move_resize()``, which can provoke another allocation. The
+    ``_placing`` re-entrancy guard stops that becoming a nested cycle, and
+    ``_place_calls`` counts invocations per scheduling round so the log can
+    show whether the WM and this controller are fighting.
     """
 
     def __init__(self) -> None:
@@ -21,6 +30,8 @@ class PlacementController:
         self._parent: Optional[Gtk.Window] = None
         self._handler_ids: List[int] = []
         self._timeout_ids: List[int] = []
+        self._placing = False
+        self._place_calls = 0
 
     def cancel(self) -> None:
         if self._window is not None:
@@ -37,6 +48,11 @@ class PlacementController:
                 pass
         self._timeout_ids = []
         self._parent = None
+        if self._place_calls:
+            # High counts here mean the WM is rejecting our geometry and we are
+            # re-asserting it in a loop — the prime suspect for render freezes.
+            log.debug('place.round_finished', calls=self._place_calls)
+            self._place_calls = 0
 
     def schedule(self, window: Gtk.Window, parent: Optional[Gtk.Window]) -> None:
         self.cancel()
@@ -83,25 +99,49 @@ class PlacementController:
             return False
         if self._window is not None and self._window is not window:
             return False
+        # _force() resizes, which can re-enter here via size-allocate. Skipping
+        # the nested call cannot change where the window lands — the outer call
+        # is still going to apply its geometry.
+        if self._placing:
+            log.debug('place.reentrant_skipped')
+            return False
+
+        self._placing = True
+        self._place_calls += 1
         try:
-            w, h = self._pixel_size(window)
-            pos = self._center_on_parent(parent, w, h) if parent is not None else None
-            if pos is None:
-                monitor = self._target_monitor(parent)
-                if monitor is None:
-                    return False
-                pos = self._center_on_monitor(monitor, w, h)
-            x, y = pos
-            self._force(window, x, y, w, h)
+            with log.span('place') as span:
+                w, h = self._pixel_size(window)
+                pos = (
+                    self._center_on_parent(parent, w, h)
+                    if parent is not None
+                    else None
+                )
+                span['on_parent'] = pos is not None
+                if pos is None:
+                    monitor = self._target_monitor(parent)
+                    if monitor is None:
+                        span['result'] = 'no_monitor'
+                        return False
+                    pos = self._center_on_monitor(monitor, w, h)
+                x, y = pos
+                span.update({'x': x, 'y': y, 'w': w, 'h': h})
+                self._force(window, x, y, w, h)
         except Exception:
-            pass
+            log.exception('place.failed')
+        finally:
+            self._placing = False
         return False
 
     def _on_map(self, window: Gtk.Window, _event: Any) -> bool:
+        log.debug('place.on_map')
         self.place(window, self._parent)
         return False
 
     def _on_size_allocate(self, window: Gtk.Window, _allocation: Any) -> None:
+        # Re-entrant by construction: place() resizes, which allocates again.
+        # place()'s guard breaks the recursion; this line lets the log show how
+        # often the WM bounces us.
+        log.debug('place.on_size_allocate')
         self.place(window, self._parent)
         try:
             alloc = window.get_allocation()
@@ -115,7 +155,7 @@ class PlacementController:
                 if hid in self._handler_ids:
                     self._handler_ids.remove(hid)
         except Exception:
-            pass
+            log.exception('place.allocate_cleanup_failed')
 
     @staticmethod
     def _pixel_size(window: Gtk.Window) -> Tuple[int, int]:
@@ -231,24 +271,18 @@ class PlacementController:
 
     @staticmethod
     def _force(window: Gtk.Window, x: int, y: int, w: int, h: int) -> None:
-        try:
+        with log.swallow('place.set_gravity'):
             window.set_gravity(Gdk.Gravity.NORTH_WEST)
-        except Exception:
-            pass
-        for action in (
-            lambda: window.resize(w, h),
-            lambda: window.move(x, y),
+        for name, action in (
+            ('resize', lambda: window.resize(w, h)),
+            ('move', lambda: window.move(x, y)),
         ):
-            try:
+            with log.swallow('place.' + name):
                 action()
-            except Exception:
-                pass
-        try:
+        with log.swallow('place.move_resize'):
             gdk_win = window.get_window()
             if gdk_win is not None:
                 gdk_win.move_resize(x, y, w, h)
-        except Exception:
-            pass
         try:
             geom = Gdk.Geometry()
             geom.min_width = geom.max_width = geom.base_width = w
@@ -262,4 +296,4 @@ class PlacementController:
             )
             window.set_geometry_hints(None, geom, hints)
         except Exception:
-            pass
+            log.exception('place.geometry_hints_failed')
