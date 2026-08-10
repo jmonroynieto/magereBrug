@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import gi
@@ -54,6 +55,20 @@ def _add_class(widget: Gtk.Widget, name: str) -> None:
         widget.get_style_context().add_class(name)
     except Exception:
         pass
+
+
+def _diagnose_command() -> str:
+    """Absolute path to diagnose.py, so the printed command is copy-pasteable.
+
+    The plugin is installed by copying, not by pip, so there is no console
+    script and no guarantee the package is importable from the user's cwd.
+    """
+    try:
+        import magere_brug.diagnose as diagnose_module
+
+        return os.path.abspath(diagnose_module.__file__)
+    except Exception:
+        return '-m magere_brug.diagnose'
 
 
 def _parse_accel(accel_str: str):
@@ -235,8 +250,8 @@ class MagereBrug(plugin.MenuItem):
             'magereBrug %s — diagnostics' % __version__,
             '  log file : %s' % path,
             '  level    : set MAGEREBRUG_LOG_LEVEL=DEBUG (or debug=True in config)',
-            '  report   : python3 -m magere_brug.diagnose',
-            '  live tail: python3 -m magere_brug.diagnose --follow',
+            '  report   : python3 %s' % _diagnose_command(),
+            '  live tail: python3 %s --follow' % _diagnose_command(),
             '  opens=%d hook_ticks=%d terminals=%d rss_kb=%s'
             % (
                 self._opens,

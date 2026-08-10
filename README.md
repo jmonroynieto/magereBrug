@@ -114,12 +114,18 @@ chatty logger would cause the very stalls it is meant to measure.
 ### Reading the log
 
 ```bash
-python3 -m magere_brug.diagnose            # summary: sessions, stalls, slow ops, errors
-python3 -m magere_brug.diagnose --tail 50  # last 50 raw lines
-python3 -m magere_brug.diagnose --follow   # live tail, survives rotation
-python3 -m magere_brug.diagnose --json     # machine-readable summary
-python3 -m magere_brug.diagnose --path     # just print the log path
+# works from anywhere
+D=~/.config/terminator/plugins/magere_brug/diagnose.py
+
+python3 $D            # summary: sessions, stalls, slow ops, errors
+python3 $D --tail 50  # last 50 raw lines
+python3 $D --follow   # live tail, survives rotation
+python3 $D --json     # machine-readable summary
+python3 $D --path     # just print the log path
 ```
+
+From the plugins directory (or the repo root) the module form works too:
+`python3 -m magere_brug.diagnose`.
 
 **Right-click → magereBrug Diagnostics…** prints the log path and a one-line
 health summary straight into the terminal you clicked in.

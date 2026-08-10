@@ -5,6 +5,12 @@
     python3 -m magere_brug.diagnose --follow   # live tail
     python3 -m magere_brug.diagnose --json     # machine-readable summary
 
+The ``-m`` form needs the plugins directory on ``sys.path`` (i.e. run it from
+there). Running the file by path works from anywhere, which is usually what you
+want when something has just gone wrong::
+
+    python3 ~/.config/terminator/plugins/magere_brug/diagnose.py
+
 Like :mod:`magere_brug.log`, this module imports no ``gi`` and no
 ``terminatorlib`` at import time, so it runs from any Python on the box while
 Terminator is running (or after it has crashed).
@@ -19,6 +25,11 @@ import subprocess
 import sys
 import time
 from typing import Any, Dict, Iterable, Iterator, List, Optional
+
+if __name__ == '__main__' and __package__ in (None, ''):
+    # Invoked by path (``python3 .../magere_brug/diagnose.py``): put the
+    # plugins directory on sys.path so the package imports resolve.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from magere_brug.log import (
     EVENT_SESSION_END,
