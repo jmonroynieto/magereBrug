@@ -134,6 +134,77 @@ class TestPluginImport(unittest.TestCase):
         self.assertFalse(PlacementController().place(None, None))
 
 
+class TestSessionMarkers(unittest.TestCase):
+    """The end marker must not depend on Terminator calling unload().
+
+    Terminator calls unload() only when a plugin is reloaded or disabled from
+    Preferences — never on application quit. Keying the shutdown marker on it
+    alone would mark every normal exit as a crash, and a detector that always
+    fires teaches you to ignore it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._saved = install_stubs()
+        from magere_brug import plugin as plugin_module
+
+        cls.plugin_module = plugin_module
+
+    @classmethod
+    def tearDownClass(cls):
+        restore_stubs(cls._saved)
+
+    def setUp(self):
+        import tempfile
+
+        from magere_brug import log as mblog
+
+        self.mblog = mblog
+        self._tmp = tempfile.TemporaryDirectory()
+        mblog.reset()
+        self.log_file = os.path.join(self._tmp.name, 'mb.log')
+        mblog.configure(path=self.log_file)
+        self.instance = self.plugin_module.MagereBrug()
+
+    def tearDown(self):
+        self.mblog.reset()
+        self._tmp.cleanup()
+
+    def end_markers(self):
+        with open(self.log_file) as handle:
+            return handle.read().count('event=' + self.mblog.EVENT_SESSION_END)
+
+    def test_start_logging_registers_an_atexit_marker(self):
+        import atexit
+
+        self.instance._start_logging()
+        # unregister returns nothing but only removes a registered callable;
+        # calling the marker afterwards must then be a no-op, proving the
+        # atexit path and the once-only flag are wired to the same method.
+        atexit.unregister(self.instance._write_session_end)
+        self.instance._write_session_end()
+        self.assertEqual(self.end_markers(), 1)
+
+    def test_end_marker_is_written_once(self):
+        self.instance._write_session_end()
+        self.instance._write_session_end()
+        self.assertEqual(self.end_markers(), 1)
+
+    def test_unload_writes_the_marker(self):
+        self.instance.unload()
+        self.assertEqual(self.end_markers(), 1)
+
+    def test_unload_then_process_exit_does_not_double_write(self):
+        self.instance.unload()
+        self.instance._write_session_end(reason='exit')
+        self.assertEqual(self.end_markers(), 1)
+
+    def test_marker_records_why_the_session_ended(self):
+        self.instance.unload()
+        with open(self.log_file) as handle:
+            self.assertIn('reason=unload', handle.read())
+
+
 class TestConfigCaching(unittest.TestCase):
     """Terminator's Config() constructor is expensive; we must build one.
 

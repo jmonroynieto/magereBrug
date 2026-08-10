@@ -50,5 +50,13 @@ WATCHDOG_SUMMARY_MS = 30000
 # without paying for a /proc read twice a second.
 RSS_SAMPLE_EVERY = 120
 
+# place() calls in one scheduling round before we call it pathological. A
+# healthy round is the PLACE_RETRY_MS retries plus map plus a couple of
+# allocations — well under this. Hundreds means the WM is rejecting our
+# geometry and we are re-asserting it in a loop, which is the leading suspect
+# for render freezes; it warns at the default level so the first occurrence is
+# visible without having to reproduce the freeze again under DEBUG.
+PLACE_CALLS_WARN = 20
+
 # Word-boundary characters for fuzzy scoring.
 WORD_BOUNDARY = ' /.-_[]'

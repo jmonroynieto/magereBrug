@@ -163,11 +163,24 @@ PID, because one file collects every Terminator process and plugin reload:
 | `hook.tick.slow` | The 1.5s background rescan is expensive. |
 | `gather_terminals.slow` | Building the navigator list is slow (it reads `/proc` per terminal). |
 | `navigator.open.slow` | Opening the palette is slow — check the spans inside it. |
-| `session.start` with no matching `session.end` | The process died without unloading. `diagnose` calls this out; it is the signature of a hard crash. |
+| `place.round_finished` at WARN | More than 20 `place()` calls in one round — the placement controller and the window manager are fighting. |
+| `session.start` with no matching `session.end` | The process did not exit cleanly. `diagnose` calls this out; see the note below. |
 
 A GTK/VTE **segfault** leaves nothing in this log — no Python runs after it.
 The missing `session.end` marker is the only evidence, which is why it exists.
 For a segfault itself, check `coredumpctl list terminator` or `journalctl`.
+
+The end marker is written from `atexit`, which runs on a clean interpreter
+exit and does not run on a segfault or `SIGKILL`. It is deliberately not tied
+to the plugin's `unload()`: Terminator calls that only when a plugin is
+reloaded or disabled from Preferences, never on quit. A `SIGTERM` also skips
+`atexit`, so read a missing marker as "did not exit cleanly" rather than
+"segfaulted".
+
+**Caveat:** two Terminator processes write to one file, and rotation between
+them can race — one may keep writing to the renamed file. Lines carry the PID
+so you can still separate them; raise `MAGEREBRUG_LOG_MAX_BYTES` if rotation
+is happening often enough to matter.
 
 ## Development
 

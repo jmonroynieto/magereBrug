@@ -6,7 +6,12 @@ from typing import Any, List, Optional, Tuple
 
 from gi.repository import Gdk, GLib, Gtk
 
-from magere_brug.constants import NAV_HEIGHT, NAV_WIDTH, PLACE_RETRY_MS
+from magere_brug.constants import (
+    NAV_HEIGHT,
+    NAV_WIDTH,
+    PLACE_CALLS_WARN,
+    PLACE_RETRY_MS,
+)
 from magere_brug.log import get_logger
 
 log = get_logger('placement')
@@ -51,7 +56,12 @@ class PlacementController:
         if self._place_calls:
             # High counts here mean the WM is rejecting our geometry and we are
             # re-asserting it in a loop — the prime suspect for render freezes.
-            log.debug('place.round_finished', calls=self._place_calls)
+            # Individual calls are usually under the span threshold, so without
+            # this line a stall would show up with no attribution.
+            if self._place_calls > PLACE_CALLS_WARN:
+                log.warn('place.round_finished', calls=self._place_calls)
+            else:
+                log.debug('place.round_finished', calls=self._place_calls)
             self._place_calls = 0
 
     def schedule(self, window: Gtk.Window, parent: Optional[Gtk.Window]) -> None:

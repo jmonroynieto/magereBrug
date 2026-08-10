@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -136,6 +137,7 @@ class MagereBrug(plugin.MenuItem):
         self._hook_ticks = 0
         self._opens = 0
         self._rehook_pending_id: Optional[int] = None
+        self._session_ended = False
 
         GLib.idle_add(self._deferred_setup)
 
@@ -163,6 +165,27 @@ class MagereBrug(plugin.MenuItem):
         # without a shutdown line — the signature of a hard crash, which is
         # otherwise invisible because a GTK/VTE segfault logs nothing.
         log.warn(mblog.EVENT_SESSION_START, **fields)
+        # The end marker hangs off atexit, not unload(): Terminator calls
+        # unload() only when a plugin is reloaded or disabled from Preferences,
+        # never on application quit. Keying the marker on unload() alone would
+        # mark every normal exit as a crash — a detector that always fires.
+        # atexit runs on clean interpreter exit and does not run on a segfault,
+        # which is exactly the distinction we want. It is registered ahead of
+        # logging's own atexit hook, so the handlers are still open.
+        atexit.register(self._write_session_end)
+
+    def _write_session_end(self, reason: str = 'exit') -> None:
+        """Write the shutdown marker at most once per plugin instance."""
+        if self._session_ended:
+            return
+        self._session_ended = True
+        log.warn(
+            mblog.EVENT_SESSION_END,
+            reason=reason,
+            opens=self._opens,
+            hook_ticks=self._hook_ticks,
+            rss_kb=mblog.rss_kb(),
+        )
 
     def _deferred_setup(self) -> bool:
         dbg('magereBrug: plugin setup')
@@ -185,7 +208,11 @@ class MagereBrug(plugin.MenuItem):
         if report is not None:
             log.warn('mainloop.stall', **report)
         self._watchdog_ticks += 1
-        if self._watchdog_ticks % RSS_SAMPLE_EVERY == 0:
+        # Arguments evaluate before the call, so rss_kb() and _all_terminals()
+        # would run on every sample even at WARNING, where the record is then
+        # thrown away. Check the level first — this is a watchdog in a process
+        # the user reports as freezing; it must not add work of its own.
+        if self._watchdog_ticks % RSS_SAMPLE_EVERY == 0 and log.enabled():
             log.debug(
                 'process.rss',
                 rss_kb=mblog.rss_kb(),
@@ -218,12 +245,13 @@ class MagereBrug(plugin.MenuItem):
         except Exception as exc:
             log.exception('unload.unhook_failed')
             err('magereBrug unload: %s' % exc)
-        log.warn(
-            mblog.EVENT_SESSION_END,
-            opens=self._opens,
-            hook_ticks=self._hook_ticks,
-            rss_kb=mblog.rss_kb(),
-        )
+        # Reload/disable path. atexit still covers process exit; the marker is
+        # idempotent, and unregistering avoids pinning this instance alive.
+        self._write_session_end(reason='unload')
+        try:
+            atexit.unregister(self._write_session_end)
+        except Exception:
+            pass
 
     def callback(self, menuitems, menu, terminal) -> None:
         """Add the navigator item to the terminal context menu (3-arg API)."""
@@ -289,8 +317,10 @@ class MagereBrug(plugin.MenuItem):
         if Config is None:
             return None
         if self._config is None:
-            with log.span('config.construct'):
-                self._config = Config()
+            # Not spanned: the first call happens inside _start_logging, before
+            # a handler is attached, and every later call is cached — the span
+            # could never write anything.
+            self._config = Config()
         return self._config
 
     def _plugin_config(self) -> dict:
