@@ -3,10 +3,106 @@
 Working notes on why this plugin might be stalling Terminator, what evidence
 would settle each theory, and what the instrumentation can and cannot see.
 
-**Status:** the suspects below are derived from reading the code and
-Terminator's source. Neither has been observed causing a freeze. That is what
-the logging is for — this document exists so that the next freeze produces an
-answer instead of another round of guessing.
+**Status:** found, 2026-08-28. The cause was not on the suspect list: plugin
+reloads were leaking timers, and orphaned timers were leaking signal handlers.
+See [The confirmed cause](#the-confirmed-cause-leaked-timers-and-leaked-handlers).
+The suspects below are kept as written, because the reasoning that ruled them
+out is the useful part.
+
+## The confirmed cause: leaked timers and leaked handlers
+
+Two defects that compound only across plugin reloads. A short session shows
+neither, which is why reading the code found the wrong suspects.
+
+### Evidence
+
+A Terminator process up 6d12h, RSS 1.14 GB, 4.3% CPU sustained, with four
+terminals open. From `diagnose`:
+
+- `hook.tick.slow count=30558 max=593ms total=5706705ms`
+- `mainloop.stall reports=1239 stalls=13605 worst=24933ms`
+
+The tick is supposed to run every 1500 ms. Counting ticks in the newest log
+gives 2.009/s against an expected 0.667/s — **3.01 timers** — while the log
+contains exactly one live plugin instance (last `session.start` 15:52:25, no
+`session.end` after it). Three ticks arrive back-to-back, each starting as the
+previous one ends:
+
+```text
+17:52:49.047 hook.tick.slow terminals=4 duration_ms=133.9
+17:52:49.169 hook.tick.slow terminals=4 duration_ms=122.3
+17:52:49.291 hook.tick.slow terminals=4 duration_ms=121.4
+17:52:50.549 …                                       ← next burst, +1502ms
+```
+
+Three watchdogs report the same stall at the same instant with max_ms 387.1,
+387.2, 387.3. About 400 ms of every 1500 ms went to hook ticks — a 27% duty
+cycle on the main loop, felt as typing lag in every terminal.
+
+`session.end` markers show RSS climbing monotonically across reloads:
+726 MB → 772 MB → 934 MB → 1022 MB, and 1166 MB by the time it was measured.
+
+### Defect 1 — setup arming an already-unloaded instance
+
+`__init__` queues `GLib.idle_add(self._deferred_setup)`. Terminator's
+`load_plugins(force=True)` (`terminatorlib/plugin.py:105`) calls `unload()` on
+the old instance and constructs the new one synchronously — while the old
+instance's idle callback is still queued.
+
+`unload()` removed `_hook_timeout_id` and `_watchdog_timeout_id`, but at that
+point they were still `None`: setup had not run yet. The idle callback then
+fired on the dead instance and installed both timers, and nothing holds a
+reference that could ever remove them. Each reload leaked another pair.
+
+Per-instance arithmetic confirms each *live* instance ran exactly one timer —
+`hook_ticks=1189` over 1796 s, `1643` over 2466 s, `2414` over 3647 s, all
+0.66/s. The surplus ticks belonged to instances that had already logged
+`session.end`.
+
+**Fixed** by latching an `_unloaded` flag, keeping the idle source id so
+`unload()` can cancel it, and making `_deferred_setup` bail if it is already
+armed.
+
+### Defect 2 — the owner tag could not clean up after itself
+
+Handlers were tagged with the owning instance (`_magere_brug_bound_owner`) so
+a reload would rebind rather than skip. But the tag records *that* someone else
+bound the handler, not *which* handler to remove — so `_hook_one_terminal`
+connected a new one and left the old one attached.
+
+With one instance this is harmless: the tag matches and nothing rebinds. With
+the orphaned timers from defect 1 it becomes a ping-pong. Instance A's tick
+sets the tag to A; instance C's tick sees "not C", connects another handler,
+sets the tag to C; A's next tick sees "not A"… Every tick, every orphan, every
+terminal added one `key-press-event` handler that was never removed. A test
+running two owners for 50 rounds produced 100 handlers where there should be 1.
+
+The unbounded growth is proven (100 handlers where there should be 1) and
+accounts for the memory: every keystroke in every terminal is dispatched
+through that list by construction. The ~130 ms per tick is *consistent* with
+`connect()` walking the same list — GObject's `handler_insert` scans — but that
+was never measured, and one fact sits against it: the duration stayed flat near
+130 ms while the terminal count fell from 10 to 4, which a pure per-terminal
+cost would not do. Treat the per-tick constant as unexplained. It does not
+affect either fix; both defects stand on their own evidence.
+
+`_unhook_terminal` had a matching bug — the fallback path binds a lambda to the
+*vte*, but cleanup called `term.disconnect_by_func(self._on_terminal_focus_in)`,
+which never matched anything.
+
+**Fixed** by recording the handler id next to the owner tag and disconnecting
+by id before rebinding. Regression tests are in `tests/test_plugin_lifecycle.py`.
+
+### What this says about the old suspects
+
+Suspect 1 (placement) was never implicated: no `place.*` events appear near any
+stall. Suspect 2 named the right function for the wrong reason — the cost was
+never the `Config()` construction, it was the handler list the tick was
+extending. Suspect 4's note that `_on_vte_key_press` "runs on every keystroke
+in every terminal" was the right instinct; what it missed is that there was
+more than one of them.
+
+---
 
 ## Capturing a freeze
 

@@ -139,7 +139,13 @@ class MagereBrug(plugin.MenuItem):
         self._rehook_pending_id: Optional[int] = None
         self._session_ended = False
 
-        GLib.idle_add(self._deferred_setup)
+        # Terminator constructs the plugin, then may unload() it before this
+        # idle callback ever runs (load_plugins(force=True) twice in a row).
+        # Setup would then install timers on an already-dead instance that
+        # nothing will ever remove. Keep the source id so unload() can cancel
+        # it, and latch the fact so a callback already in flight bails out.
+        self._unloaded = False
+        self._setup_idle_id: Optional[int] = GLib.idle_add(self._deferred_setup)
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -188,6 +194,14 @@ class MagereBrug(plugin.MenuItem):
         )
 
     def _deferred_setup(self) -> bool:
+        self._setup_idle_id = None
+        # Refuse to arm a corpse. Without this, an instance unloaded before
+        # its idle callback fired would still install a hook timer and a
+        # watchdog, and unload() has already run — so nothing removes them.
+        # Each leaked pair keeps ticking for the life of the process.
+        if self._unloaded or self._hook_timeout_id is not None:
+            log.debug('setup.skipped', unloaded=self._unloaded)
+            return False
         dbg('magereBrug: plugin setup')
         self._start_logging()
         self._ensure_css()
@@ -224,7 +238,9 @@ class MagereBrug(plugin.MenuItem):
         return True
 
     def unload(self) -> None:
-        for attr in ('_hook_timeout_id', '_watchdog_timeout_id', '_rehook_pending_id'):
+        self._unloaded = True
+        for attr in ('_setup_idle_id', '_hook_timeout_id', '_watchdog_timeout_id',
+                     '_rehook_pending_id'):
             source_id = getattr(self, attr, None)
             if source_id is not None:
                 try:
@@ -240,8 +256,21 @@ class MagereBrug(plugin.MenuItem):
                 pass
             self.window = None
         try:
+            seen = set()
             for term in self._all_terminals():
                 self._unhook_terminal(term)
+                # The window 'add' handler outlives the terminals; drop it here
+                # or an unloaded instance keeps rescanning on every split.
+                try:
+                    top = term.get_toplevel()
+                except Exception:
+                    continue
+                if top is None or id(top) in seen:
+                    continue
+                seen.add(id(top))
+                if getattr(top, '_magere_brug_win_bound_owner', None) is self:
+                    self._drop_handler(top, '_magere_brug_win_handler_id')
+                    top._magere_brug_win_bound_owner = None
         except Exception as exc:
             log.exception('unload.unhook_failed')
             err('magereBrug unload: %s' % exc)
@@ -394,6 +423,29 @@ class MagereBrug(plugin.MenuItem):
         except Exception:
             return []
 
+    @staticmethod
+    def _drop_handler(obj, attr: str) -> None:
+        """Disconnect a handler recorded under ``attr``, whichever instance bound it.
+
+        The owner tag alone is not enough to clean up after a previous plugin
+        instance: knowing that someone else bound the handler does not let you
+        remove it. Recording the handler id next to the tag does. Without this
+        every rebind stacked another handler on the same signal, and nothing
+        ever took one off.
+        """
+        handler_id = getattr(obj, attr, None)
+        if handler_id is None:
+            return
+        try:
+            if obj.handler_is_connected(handler_id):
+                obj.disconnect(handler_id)
+        except Exception:
+            pass
+        try:
+            setattr(obj, attr, None)
+        except Exception:
+            pass
+
     def _hook_terminal_listeners(self) -> bool:
         # Runs every HOOK_INTERVAL_MS on the main thread, forever. Anything
         # expensive in here is felt as a periodic hitch, so it is spanned.
@@ -426,8 +478,11 @@ class MagereBrug(plugin.MenuItem):
             # silently finding the terminal "already hooked".
             if getattr(top, '_magere_brug_win_bound_owner', None) is self:
                 continue
+            self._drop_handler(top, '_magere_brug_win_handler_id')
             with log.swallow('hook.window_bind'):
-                top.connect('add', self._on_window_add)
+                top._magere_brug_win_handler_id = top.connect(
+                    'add', self._on_window_add
+                )
                 top._magere_brug_win_bound_owner = self
                 log.debug('hook.window_bound')
 
@@ -457,18 +512,28 @@ class MagereBrug(plugin.MenuItem):
         # calling unload() first, a stale flag from the old instance must not
         # cause the new instance to skip binding its own handler.
         if getattr(vte, '_magere_brug_bound_owner', None) is not self:
+            self._drop_handler(vte, '_magere_brug_key_handler_id')
             try:
-                vte.connect('key-press-event', self._on_vte_key_press)
+                vte._magere_brug_key_handler_id = vte.connect(
+                    'key-press-event', self._on_vte_key_press
+                )
                 vte._magere_brug_bound_owner = self
             except Exception as exc:
                 err('magereBrug bind key: %s' % exc)
         if getattr(term, '_magere_brug_focus_bound_owner', None) is not self:
+            self._drop_handler(term, '_magere_brug_focus_handler_id')
+            self._drop_handler(vte, '_magere_brug_focus_handler_id')
             try:
-                term.connect('focus-in-event', self._on_terminal_focus_in)
+                term._magere_brug_focus_handler_id = term.connect(
+                    'focus-in-event', self._on_terminal_focus_in
+                )
                 term._magere_brug_focus_bound_owner = self
             except Exception:
                 try:
-                    vte.connect(
+                    # Terminal itself has no focus-in-event; fall back to its
+                    # vte. The id is recorded on the object it was bound to,
+                    # so the cleanup above finds it either way.
+                    vte._magere_brug_focus_handler_id = vte.connect(
                         'focus-in-event',
                         lambda _w, _e, t=term: self._note_mru(t) or False,
                     )
@@ -481,16 +546,14 @@ class MagereBrug(plugin.MenuItem):
     def _unhook_terminal(self, term) -> None:
         vte = getattr(term, 'vte', None)
         if vte is not None and getattr(vte, '_magere_brug_bound_owner', None) is self:
-            try:
-                vte.disconnect_by_func(self._on_vte_key_press)
-            except (TypeError, AttributeError):
-                pass
+            self._drop_handler(vte, '_magere_brug_key_handler_id')
             vte._magere_brug_bound_owner = None
         if getattr(term, '_magere_brug_focus_bound_owner', None) is self:
-            try:
-                term.disconnect_by_func(self._on_terminal_focus_in)
-            except (TypeError, AttributeError):
-                pass
+            # By id, not by func: the fallback path binds a lambda to the vte,
+            # which disconnect_by_func(self._on_terminal_focus_in) never matched.
+            self._drop_handler(term, '_magere_brug_focus_handler_id')
+            if vte is not None:
+                self._drop_handler(vte, '_magere_brug_focus_handler_id')
             term._magere_brug_focus_bound_owner = None
 
     def _on_terminal_focus_in(self, term, _event) -> bool:
